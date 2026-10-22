@@ -1,0 +1,1948 @@
+"""Автопостер: Telegram-бот настройки автоматической публикации видео из БД
+парсера в VK-группы по правилам «источник → группа».
+
+Пользователь задаёт свой VK-аккаунт (токен, только один), добавляет группы
+и источники, а затем связывает их правилами. Дальше публикует планировщик.
+"""
+
+import os
+import re
+import asyncio
+import time
+import logging
+from io import BytesIO
+from datetime import datetime, timedelta, time as dtime
+
+import pytz
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters,
+    ContextTypes, PicklePersistence,
+)
+from dotenv import load_dotenv
+
+import db
+import scheduler
+import account_source
+import video_processor
+import metrics
+from vk import resolve_screen_name, fetch_group_name
+from source_reader import check_source, fetch_candidates, SourceError
+
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+ERROR_RETENTION_DAYS = int(os.getenv("ERROR_RETENTION_DAYS", "5"))
+ERROR_CLEANUP_INTERVAL_DAYS = int(os.getenv("ERROR_CLEANUP_INTERVAL_DAYS", "5"))
+ERRORS_PAGE_SIZE = 8
+# Ежедневный снимок подписчиков всех групп (МСК) — из него строится история роста.
+METRICS_HOUR = int(os.getenv("METRICS_HOUR", "23"))
+METRICS_MINUTE = int(os.getenv("METRICS_MINUTE", "50"))
+GROUPS_PAGE_SIZE = 15
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ─── Состояния разговоров ─────────────────────────────────────────────────────
+ACC_NAME, ACC_TOKEN, ACC_RENAME, ACC_CHANGE_TOKEN = range(10, 14)
+G_ADD_ID, G_ADD_CONFIRM, G_ADD_NAME, G_RENAME = range(20, 24)
+SRC_NAME, SRC_TYPE, SRC_ACCOUNT, SRC_PATH, SRC_USER, SRC_START = range(30, 36)
+RULE_EDIT_VALUE = 40
+RULE_DESC_PICK = 41
+T_TITLE, T_BODY = range(50, 52)
+
+# ─── Постоянное меню ──────────────────────────────────────────────────────────
+BTN_ACCOUNTS = "🔑 Аккаунт"
+BTN_GROUPS = "👥 Группы"
+BTN_SOURCES = "🎬 Источники"
+BTN_RULES = "📋 Правила"
+BTN_STATUS = "📊 Статус"
+BTN_STATS = "📈 Статистика"
+BTN_TEMPLATES = "📝 Описания"
+BTN_PROCESS = "⚙️ Обработка"
+BTN_METRICS = "📊 Метрика"
+MENU_BUTTON_TEXTS = [BTN_ACCOUNTS, BTN_GROUPS, BTN_SOURCES, BTN_RULES, BTN_STATUS,
+                     BTN_STATS, BTN_TEMPLATES, BTN_PROCESS, BTN_METRICS]
+
+
+def main_keyboard(telegram_id: int | None = None) -> ReplyKeyboardMarkup:
+    """Постоянное меню. «Обработка» и «Метрика» — только владельцу (ADMIN_IDS)."""
+    rows = [[BTN_ACCOUNTS, BTN_GROUPS], [BTN_SOURCES, BTN_RULES],
+            [BTN_STATUS, BTN_STATS], [BTN_TEMPLATES]]
+    if telegram_id is not None and _is_admin(telegram_id):
+        rows.append([BTN_PROCESS, BTN_METRICS])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _mask_token(token: str) -> str:
+    if len(token) <= 12:
+        return "•" * len(token)
+    return f"{token[:6]}…{token[-4:]}"
+
+
+def _get_account(telegram_id: int):
+    """Единственный VK-аккаунт пользователя (или None, если ещё не добавлен)."""
+    return db.get_user_account(telegram_id)
+
+
+# ─── /start ───────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db.ensure_user(update.effective_user.id)
+    await update.message.reply_text(
+        "Привет! Я сам публикую видео из базы парсера в твои VK-группы по расписанию.\n\n"
+        "Как настроить:\n"
+        f"1. {BTN_ACCOUNTS} — добавь свой VK-аккаунт (токен).\n"
+        f"2. {BTN_GROUPS} — добавь целевые группы VK.\n"
+        f"3. {BTN_SOURCES} — добавь источники (базы парсера со ссылками).\n"
+        f"4. {BTN_RULES} — свяжи источник с группой и настрой расписание.\n\n"
+        "Дальше публикация идёт автоматически.",
+        reply_markup=main_keyboard(update.effective_user.id),
+    )
+
+
+# ─── Меню ─────────────────────────────────────────────────────────────────────
+
+async def main_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    cur = _get_account(telegram_id)
+    cur_acc_id = cur["id"] if cur else None
+    if text == BTN_ACCOUNTS:
+        await show_accounts(update, context)
+    elif text == BTN_GROUPS:
+        await update.message.reply_text("Твои группы VK:", reply_markup=groups_kb(telegram_id, cur_acc_id))
+    elif text == BTN_SOURCES:
+        await update.message.reply_text("Твои источники:", reply_markup=sources_kb(telegram_id, cur_acc_id))
+    elif text == BTN_RULES:
+        await update.message.reply_text("Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id))
+    elif text == BTN_STATUS:
+        await cmd_status(update, context)
+    elif text == BTN_STATS:
+        await cmd_stats(update, context)
+    elif text == BTN_TEMPLATES:
+        await update.message.reply_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id),
+        )
+    elif text == BTN_PROCESS:
+        await cmd_process(update, context)
+    elif text == BTN_METRICS:
+        await cmd_metrics(update, context)
+
+
+# ─── Аккаунт VK (токен) ──────────────────────────────────────────────────────
+
+ACCOUNT_TITLE = "Твой VK-аккаунт:"
+
+
+def accounts_kb(telegram_id: int) -> InlineKeyboardMarkup:
+    """Карточка единственного аккаунта; кнопка «Добавить» — только пока его нет."""
+    a = _get_account(telegram_id)
+    if not a:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc_add")],
+        ])
+    token_hint = f" · {_mask_token(db.get_vk_token_by_account(a['id']) or '')}" if a["vk_token"] else " · (нет токена)"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"👤 {a['name']}{token_hint}", callback_data="noop")],
+        [
+            InlineKeyboardButton("✏️", callback_data=f"acc_rename_{a['id']}"),
+            InlineKeyboardButton("🔑 Токен", callback_data=f"acc_token_{a['id']}"),
+            InlineKeyboardButton("🗑", callback_data=f"acc_del_{a['id']}"),
+        ],
+    ])
+
+
+async def show_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        ACCOUNT_TITLE, reply_markup=accounts_kb(update.effective_user.id)
+    )
+
+
+VK_TOKEN_PROMPT = (
+    "Пришли VK токен.\n\n"
+    "Как получить через Kate Mobile:\n"
+    "1. Открой в браузере:\n"
+    "https://oauth.vk.com/authorize?client_id=2685278&scope=1073737727&redirect_uri=https://oauth.vk.com/blank.html&display=page&response_type=token\n"
+    "2. Войди и разреши доступ.\n"
+    "3. Скопируй access_token из адресной строки."
+)
+
+
+def _is_valid_token(token: str) -> bool:
+    is_new = token.startswith("vk1.a.") and len(token) >= 26
+    is_old = len(token) >= 85 and not any(ch.isspace() for ch in token)
+    return is_new or is_old
+
+
+async def acc_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+
+    if data == "noop":
+        await query.answer()
+        return ConversationHandler.END
+
+    if data == "acc_add":
+        await query.answer()
+        if _get_account(telegram_id):
+            await query.edit_message_text(
+                "❌ Можно добавить только один VK-аккаунт. Чтобы сменить его, "
+                "обнови токен (🔑 Токен) или удали текущий.\n\n" + ACCOUNT_TITLE,
+                reply_markup=accounts_kb(telegram_id),
+            )
+            return ConversationHandler.END
+        await query.edit_message_text("Введи название аккаунта (например «Основной» или «Клиент Иванов»):")
+        return ACC_NAME
+
+    if data.startswith("acc_rename_"):
+        aid = int(data.rsplit("_", 1)[1])
+        context.user_data["acc_edit_id"] = aid
+        await query.answer()
+        await query.edit_message_text("Введи новое название аккаунта:")
+        return ACC_RENAME
+
+    if data.startswith("acc_token_"):
+        aid = int(data.rsplit("_", 1)[1])
+        context.user_data["acc_edit_id"] = aid
+        await query.answer()
+        await query.edit_message_text(VK_TOKEN_PROMPT)
+        return ACC_CHANGE_TOKEN
+
+    if data.startswith("acc_del_"):
+        aid = int(data.rsplit("_", 1)[1])
+        cnt = db.count_groups_for_account(aid)
+        if cnt > 0:
+            await query.answer(
+                f"Нельзя удалить: к этому аккаунту привязано {cnt} групп. Сначала удали их.",
+                show_alert=True,
+            )
+            return ConversationHandler.END
+        await query.answer("Удалено")
+        db.delete_account(aid)
+        await query.edit_message_text(ACCOUNT_TITLE, reply_markup=accounts_kb(telegram_id))
+        return ConversationHandler.END
+
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def acc_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if name in MENU_BUTTON_TEXTS:
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    context.user_data["acc_new_name"] = name
+    await update.message.reply_text(VK_TOKEN_PROMPT)
+    return ACC_TOKEN
+
+
+async def acc_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    token = update.message.text.strip()
+    if token in MENU_BUTTON_TEXTS:
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    if not _is_valid_token(token):
+        await update.message.reply_text("❌ Это не похоже на VK токен. Пришли правильный или /cancel.")
+        return ACC_TOKEN
+    telegram_id = update.effective_user.id
+    name = context.user_data.pop("acc_new_name", "Аккаунт")
+    try:
+        db.add_account(telegram_id, name, token)
+    except db.AccountLimitError:
+        await update.message.reply_text(
+            "❌ VK-аккаунт уже добавлен — второй завести нельзя.\n\n" + ACCOUNT_TITLE,
+            reply_markup=accounts_kb(telegram_id),
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"✅ Аккаунт «{name}» добавлен.\n\n" + ACCOUNT_TITLE,
+        reply_markup=accounts_kb(telegram_id),
+    )
+    return ConversationHandler.END
+
+
+async def acc_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if name in MENU_BUTTON_TEXTS:
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    aid = context.user_data.pop("acc_edit_id", None)
+    if aid:
+        db.update_account_name(aid, name)
+    tid = update.effective_user.id
+    await update.message.reply_text(
+        "✅ Переименовано.\n\n" + ACCOUNT_TITLE,
+        reply_markup=accounts_kb(tid),
+    )
+    return ConversationHandler.END
+
+
+async def acc_change_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    token = update.message.text.strip()
+    if token in MENU_BUTTON_TEXTS:
+        await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    if not _is_valid_token(token):
+        await update.message.reply_text("❌ Это не похоже на VK токен. Пришли правильный или /cancel.")
+        return ACC_CHANGE_TOKEN
+    aid = context.user_data.pop("acc_edit_id", None)
+    if aid:
+        db.update_account_token(aid, token)
+    tid = update.effective_user.id
+    await update.message.reply_text(
+        "✅ Токен обновлён.\n\n" + ACCOUNT_TITLE,
+        reply_markup=accounts_kb(tid),
+    )
+    return ConversationHandler.END
+
+
+# ─── Группы ───────────────────────────────────────────────────────────────────
+
+_VK_HOST_RE = re.compile(r"(?:https?://)?(?:m\.|www\.)?(?:vk\.com|vkontakte\.ru)/", re.IGNORECASE)
+
+
+def _extract_screen_name(text: str) -> str:
+    text = _VK_HOST_RE.sub("", text.strip())
+    text = text.split("?")[0].split("#")[0].strip("/")
+    if "/" in text:
+        text = text.rsplit("/", 1)[-1]
+    return text
+
+
+def resolve_vk_group(vk_token: str | None, text: str) -> tuple[int | None, str | None, str | None]:
+    raw = _extract_screen_name(text)
+    if not raw:
+        return None, None, "Пустая ссылка. Пришли ссылку на сообщество VK."
+    m = re.match(r"(?:video|wall|clip|photo)-(\d+)", raw, re.IGNORECASE)
+    if m:
+        gid = int(m.group(1))
+        return gid, fetch_group_name(vk_token, gid) if vk_token else None, None
+    m = re.match(r"(?:club|public|event)(\d+)$", raw, re.IGNORECASE)
+    if m:
+        gid = int(m.group(1))
+        return gid, fetch_group_name(vk_token, gid) if vk_token else None, None
+    if re.fullmatch(r"-?\d+", raw):
+        gid = abs(int(raw))
+        return gid, fetch_group_name(vk_token, gid) if vk_token else None, None
+    if not vk_token:
+        return None, None, (
+            f"Для добавления по короткой ссылке нужен токен аккаунта. "
+            "Либо пришли ссылку вида vk.com/club123."
+        )
+    obj = resolve_screen_name(vk_token, raw)
+    if not obj:
+        return None, None, "Не удалось найти сообщество по этой ссылке. Проверь её."
+    if obj.get("type") not in ("group", "page"):
+        return None, None, "Это не сообщество. Пришли ссылку именно на группу/паблик VK."
+    gid = int(obj["object_id"])
+    return gid, fetch_group_name(vk_token, gid), None
+
+
+def groups_kb(telegram_id: int, account_id: int | None = None, page: int = 0) -> InlineKeyboardMarkup:
+    all_groups = db.get_groups(telegram_id, account_id=account_id)
+    total = len(all_groups)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for g in all_groups[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]:
+        rows.append([InlineKeyboardButton(
+            f"{g['name']} (id {g['vk_group_id']})", callback_data="noop"
+        )])
+        rows.append([
+            InlineKeyboardButton("✏️ Переименовать", callback_data=f"g_rename_{g['id']}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"g_del_{g['id']}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"g_page_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"g_page_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Добавить группу", callback_data="g_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _rule_group_picker_kb(groups: list, page: int = 0) -> InlineKeyboardMarkup:
+    total = len(groups)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = [[InlineKeyboardButton(f"{g['name']} (id {g['vk_group_id']})",
+                                  callback_data=f"rule_grp_{g['id']}")] for g in groups[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rule_gpg_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"rule_gpg_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+def build_templates_manage_keyboard(telegram_id: int, page: int = 0) -> InlineKeyboardMarkup:
+    all_templates = db.get_templates(telegram_id)
+    total = len(all_templates)
+    pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = []
+    for t in all_templates[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]:
+        rows.append([InlineKeyboardButton(f"📝 {t['title']}", callback_data="noop")])
+        rows.append([
+            InlineKeyboardButton("✏️ Изменить", callback_data=f"t_edit_{t['id']}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"t_del_{t['id']}"),
+        ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"t_pg_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"t_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("➕ Добавить заготовку", callback_data="t_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_desc_picker_kb(telegram_id: int) -> InlineKeyboardMarkup:
+    templates = db.get_templates(telegram_id)
+    rows = [[InlineKeyboardButton(f"📝 {t['title']}", callback_data=f"rule_tpl_{t['id']}")] for t in templates]
+    rows.append([
+        InlineKeyboardButton("✏️ Ввести вручную", callback_data="rule_desc_manual"),
+        InlineKeyboardButton("🗑 Очистить", callback_data="rule_desc_clear"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _group_limit_text() -> str:
+    return (f"❌ Достигнут лимит: не больше {db.MAX_GROUPS_PER_USER} групп на пользователя. "
+            "Удали ненужную группу, чтобы добавить новую.")
+
+
+async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    db.ensure_user(update.effective_user.id)
+    cur = _get_account(update.effective_user.id)
+    await update.message.reply_text(
+        "Твои группы VK:", reply_markup=groups_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
+    return ConversationHandler.END
+
+
+async def groups_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+
+    if data == "noop":
+        await query.answer()
+        return ConversationHandler.END
+
+    if data == "g_add":
+        await query.answer()
+        cur = _get_account(telegram_id)
+        if not cur:
+            await query.edit_message_text(
+                f"Сначала добавь хотя бы один VK-аккаунт ({BTN_ACCOUNTS})."
+            )
+            return ConversationHandler.END
+        if db.count_groups(telegram_id) >= db.MAX_GROUPS_PER_USER:
+            await query.edit_message_text(
+                _group_limit_text() + "\n\nТвои группы VK:",
+                reply_markup=groups_kb(telegram_id, cur["id"]),
+            )
+            return ConversationHandler.END
+        context.user_data["pending_account_id"] = cur["id"]
+        context.user_data["pending_account_token"] = db.get_vk_token_by_account(cur["id"])
+        await query.edit_message_text(
+            "Пришли ссылку на сообщество VK:\n"
+            "• vk.com/club123456\n• vk.com/public123456\n• vk.com/my_group"
+        )
+        return G_ADD_ID
+
+    if data.startswith("g_page_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        cur = _get_account(telegram_id)
+        await query.edit_message_text(
+            "Твои группы VK:",
+            reply_markup=groups_kb(telegram_id, cur["id"] if cur else None, page),
+        )
+        return ConversationHandler.END
+
+    if data.startswith("g_del_"):
+        await query.answer("Удалено")
+        db.delete_group(int(data.rsplit("_", 1)[1]))
+        cur = _get_account(telegram_id)
+        await query.edit_message_text(
+            "Твои группы VK:",
+            reply_markup=groups_kb(telegram_id, cur["id"] if cur else None),
+        )
+        return ConversationHandler.END
+
+    if data.startswith("g_rename_"):
+        await query.answer()
+        context.user_data["rename_group_id"] = int(data.rsplit("_", 1)[1])
+        await query.edit_message_text("Введи новое название группы:")
+        return G_RENAME
+
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def groups_add_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    vk_token = context.user_data.get("pending_account_token")
+    loop = asyncio.get_running_loop()
+    group_id, name, error = await loop.run_in_executor(
+        None, resolve_vk_group, vk_token, update.message.text
+    )
+    if error:
+        await update.message.reply_text(error + "\n\nПопробуй ещё раз или /cancel.")
+        return G_ADD_ID
+    context.user_data["pending_group_id"] = group_id
+    if name:
+        context.user_data["pending_group_name"] = name
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Сохранить", callback_data="g_confirmname")],
+            [InlineKeyboardButton("✏️ Задать своё имя", callback_data="g_manualname")],
+        ])
+        await update.message.reply_text(f"Нашёл: «{name}» (id {group_id}). Сохранить?", reply_markup=kb)
+        return G_ADD_CONFIRM
+    await update.message.reply_text(f"Сообщество найдено (id {group_id}). Введи название вручную:")
+    return G_ADD_NAME
+
+
+async def groups_add_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    telegram_id = update.effective_user.id
+    account_id = context.user_data.get("pending_account_id")
+    if query.data == "g_confirmname":
+        try:
+            db.add_group(telegram_id, context.user_data["pending_group_id"],
+                         context.user_data["pending_group_name"], account_id)
+        except db.GroupLimitError:
+            await query.edit_message_text(
+                _group_limit_text() + "\n\nТвои группы VK:",
+                reply_markup=groups_kb(telegram_id, account_id),
+            )
+            return ConversationHandler.END
+        await query.edit_message_text(
+            "✅ Группа добавлена.\n\nТвои группы VK:",
+            reply_markup=groups_kb(telegram_id, account_id),
+        )
+        return ConversationHandler.END
+    await query.edit_message_text("Введи название группы вручную:")
+    return G_ADD_NAME
+
+
+async def groups_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    account_id = context.user_data.get("pending_account_id")
+    try:
+        db.add_group(telegram_id, context.user_data["pending_group_id"],
+                     update.message.text.strip(), account_id)
+    except db.GroupLimitError:
+        await update.message.reply_text(
+            _group_limit_text() + "\n\nТвои группы VK:",
+            reply_markup=groups_kb(telegram_id, account_id),
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "✅ Группа добавлена.\n\nТвои группы VK:",
+        reply_markup=groups_kb(telegram_id, account_id),
+    )
+    return ConversationHandler.END
+
+
+async def groups_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    cur = _get_account(telegram_id)
+    db.rename_group(context.user_data["rename_group_id"], update.message.text.strip())
+    await update.message.reply_text(
+        "✅ Переименовано.\n\nТвои группы VK:",
+        reply_markup=groups_kb(telegram_id, cur["id"] if cur else None),
+    )
+    return ConversationHandler.END
+
+
+# ─── Источники ────────────────────────────────────────────────────────────────
+
+def sources_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for s in db.get_sources(telegram_id, for_account_id=account_id):
+        if s["kind"] == "account":
+            label = f"🎵 {s['name']} (@{s['account']})"
+        else:
+            label = f"🗄 {s['name']}" + (f" · @{s['username']}" if s["username"] else "")
+        rows.append([InlineKeyboardButton(label, callback_data="noop")])
+        btn_row = []
+        if s["kind"] == "account":
+            btn_row.append(InlineKeyboardButton("🔄 Обновить", callback_data=f"src_refresh_{s['id']}"))
+            start = s["parse_start"] if "parse_start" in s.keys() else 1
+            btn_row.append(InlineKeyboardButton(f"⚙️ Старт: {start}", callback_data=f"src_start_{s['id']}"))
+        btn_row.append(InlineKeyboardButton("🗑 Удалить", callback_data=f"src_del_{s['id']}"))
+        rows.append(btn_row)
+    rows.append([InlineKeyboardButton("➕ Добавить источник", callback_data="src_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_sources(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    db.ensure_user(update.effective_user.id)
+    cur = _get_account(update.effective_user.id)
+    await update.message.reply_text(
+        "Твои источники:", reply_markup=sources_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
+    return ConversationHandler.END
+
+
+async def sources_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+    if data == "noop":
+        await query.answer()
+        return ConversationHandler.END
+    if data == "src_add":
+        await query.answer()
+        cur = _get_account(telegram_id)
+        if not cur:
+            await query.edit_message_text(
+                f"Сначала добавь хотя бы один VK-аккаунт ({BTN_ACCOUNTS})."
+            )
+            return ConversationHandler.END
+        context.user_data["src_account_id"] = cur["id"]
+        await query.edit_message_text("Введи название источника (например «TikTok Batek»):")
+        return SRC_NAME
+    if data.startswith("src_del_"):
+        await query.answer("Удалено")
+        db.delete_source(int(data.rsplit("_", 1)[1]))
+        cur = _get_account(telegram_id)
+        await query.edit_message_text(
+            "Твои источники:",
+            reply_markup=sources_kb(telegram_id, cur["id"] if cur else None),
+        )
+        return ConversationHandler.END
+    if data.startswith("src_refresh_"):
+        await query.answer("Обновляю…")
+        cur = _get_account(telegram_id)
+        await _refresh_source(query, int(data.rsplit("_", 1)[1]), cur["id"] if cur else None)
+        return ConversationHandler.END
+    if data.startswith("src_start_"):
+        sid = int(data.rsplit("_", 1)[1])
+        s = db.get_source(sid)
+        if not s or s["kind"] != "account":
+            await query.answer()
+            return ConversationHandler.END
+        await query.answer()
+        context.user_data["src_start_id"] = sid
+        cur_start = s["parse_start"] if "parse_start" in s.keys() else 1
+        embed_note = (
+            "\n\n⚠️ Резервный embed-парсер отдаёт лишь последние ~10-30 роликов, "
+            "поэтому большой старт сработает только пока yt-dlp читает аккаунт."
+        )
+        await query.edit_message_text(
+            f"С какого ролика начинать парсинг @{s['account']}?\n\n"
+            f"Сейчас: {cur_start} (1 = с самого свежего).\n"
+            "Пришли число (например 20 — пропустить 19 свежих и парсить окно старее)."
+            + embed_note
+        )
+        return SRC_START
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def sources_start_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    try:
+        start = int(raw)
+        if start < 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Нужно целое число ≥ 1. Пришли ещё раз или /cancel.")
+        return SRC_START
+    sid = context.user_data.get("src_start_id")
+    if sid is None:
+        return ConversationHandler.END
+    db.set_source_parse_start(sid, start)
+    cur = _get_account(update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ Старт парсинга: {start}. Применится при следующем обновлении.\n\n"
+        "Твои источники:",
+        reply_markup=sources_kb(update.effective_user.id, cur["id"] if cur else None),
+    )
+    return ConversationHandler.END
+
+
+async def _refresh_source(query, source_id: int, account_id: int | None = None) -> None:
+    s = db.get_source(source_id)
+    if not s or s["kind"] != "account":
+        return
+    await query.edit_message_text(f"⏳ Парсю @{s['account']}…")
+    path = s["db_path"] or account_source.source_db_path(source_id)
+    start = s["parse_start"] if "parse_start" in s.keys() else 1
+    loop = asyncio.get_running_loop()
+    try:
+        res = await loop.run_in_executor(
+            None, account_source.refresh_account, s["account"], path,
+            account_source.PARSE_LIMIT, start,
+        )
+        note = f"✅ @{res['username']}: всего {res['total']}, новых {res['added']} (старт {start})."
+    except Exception as exc:
+        note = f"❌ Не удалось спарсить @{s['account']}:\n{exc}"
+    await query.message.reply_text(note)
+    await query.message.reply_text("Твои источники:", reply_markup=sources_kb(s["telegram_id"], account_id))
+
+
+async def sources_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["src_name"] = update.message.text.strip()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 TikTok-аккаунт (бот парсит сам)", callback_data="src_type_account")],
+        [InlineKeyboardButton("🗄 Готовая база парсера (файл .db)", callback_data="src_type_db")],
+    ])
+    await update.message.reply_text("Какой это источник?", reply_markup=kb)
+    return SRC_TYPE
+
+
+async def sources_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "src_type_account":
+        await query.edit_message_text(
+            "Пришли ссылку или @ник TikTok-аккаунта, который парсить.\n"
+            "Например: https://www.tiktok.com/@batek.official или @batek.official"
+        )
+        return SRC_ACCOUNT
+    await query.edit_message_text(
+        "Пришли путь к базе парсера (SQLite-файл со ссылками),\n"
+        "например: C:\\Users\\...\\batek.official.db"
+    )
+    return SRC_PATH
+
+
+async def sources_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip()
+    try:
+        username, _ = account_source.normalize(raw)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}\nПришли корректную ссылку/ник или /cancel.")
+        return SRC_ACCOUNT
+
+    telegram_id = update.effective_user.id
+    account_id = context.user_data.get("src_account_id")
+    sid = db.add_source(telegram_id, context.user_data["src_name"], "", None,
+                        kind="account", account=username, account_id=account_id)
+    path = account_source.source_db_path(sid)
+    db.set_source_db_path(sid, path)
+
+    await update.message.reply_text(f"⏳ Первый парсинг @{username}…")
+    loop = asyncio.get_running_loop()
+    try:
+        res = await loop.run_in_executor(
+            None, account_source.refresh_account, username, path,
+            account_source.PARSE_LIMIT, 1,
+        )
+        note = f"✅ Источник добавлен. Собрано ссылок: {res['total']} (новых {res['added']})."
+    except Exception as exc:
+        note = (f"⚠️ Источник добавлен, но первый парсинг не удался:\n{exc}\n"
+                "Можно повторить кнопкой «🔄 Обновить».")
+    await update.message.reply_text(note)
+    await update.message.reply_text(
+        "Твои источники:", reply_markup=sources_kb(telegram_id, account_id)
+    )
+    return ConversationHandler.END
+
+
+async def sources_path(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    path = update.message.text.strip().strip('"')
+    try:
+        count = check_source(path)
+    except SourceError as e:
+        await update.message.reply_text(f"❌ {e}\n\nПришли корректный путь или /cancel.")
+        return SRC_PATH
+    context.user_data["src_path"] = path
+    await update.message.reply_text(
+        f"✅ База найдена, видео в ней: {count}.\n\n"
+        "Если нужно брать только один ник из базы — пришли его (например batek.official).\n"
+        "Если брать все — отправь «-»."
+    )
+    return SRC_USER
+
+
+async def sources_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = update.message.text.strip().lstrip("@")
+    username = None if raw in ("-", "") else raw
+    telegram_id = update.effective_user.id
+    account_id = context.user_data.get("src_account_id")
+    db.add_source(telegram_id, context.user_data["src_name"], context.user_data["src_path"],
+                  username, kind="db", account_id=account_id)
+    await update.message.reply_text(
+        "✅ Источник добавлен.\n\nТвои источники:",
+        reply_markup=sources_kb(telegram_id, account_id),
+    )
+    return ConversationHandler.END
+
+
+# ─── Правила ──────────────────────────────────────────────────────────────────
+
+def rules_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = []
+    for r in db.get_rules(telegram_id, account_id=account_id):
+        mark = "🟢" if r["enabled"] else "⚪"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {r['source_name']} → {r['group_name']}", callback_data=f"rule_open_{r['id']}"
+        )])
+    rows.append([InlineKeyboardButton("➕ Добавить правило", callback_data="rule_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def rule_detail_text(r) -> str:
+    dur = "любая"
+    if r["min_duration"] is not None or r["max_duration"] is not None:
+        lo = r["min_duration"] if r["min_duration"] is not None else 0
+        hi = r["max_duration"] if r["max_duration"] is not None else "∞"
+        dur = f"{lo}..{hi} сек"
+    order = "старые→новые" if r["order_dir"] == "old" else "новые→старые"
+    repost = "🔁 вкл" if r["allow_repost"] else "выкл"
+    return (
+        f"📋 Правило #{r['id']}\n"
+        f"🎬 Источник: {r['source_name']}\n"
+        f"👥 Группа: {r['group_name']} (id {r['vk_group_id']})\n"
+        f"▶️ Статус: {'включено' if r['enabled'] else 'выключено'}\n"
+        f"🔢 Видео в день: {r['videos_per_day']}\n"
+        f"🕒 Слоты (МСК): {r['slots']}\n"
+        f"⏱ Длительность: {dur}\n"
+        f"↕️ Порядок: {order}\n"
+        f"🔄 Перезаливка: {repost}\n"
+        f"📝 Описание: {(r['description'] or '—')[:100]}\n"
+        f"✅ Опубликовано: {db.count_published(r['id'])}"
+    )
+
+
+def rule_detail_kb(r) -> InlineKeyboardMarkup:
+    rid = r["id"]
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⛔ Выключить" if r["enabled"] else "✅ Включить",
+                              callback_data=f"rule_toggle_{rid}")],
+        [InlineKeyboardButton("🔢 Видео/день", callback_data=f"rule_nday_{rid}"),
+         InlineKeyboardButton("🕒 Слоты", callback_data=f"rule_slots_{rid}")],
+        [InlineKeyboardButton("⏱ Длительность", callback_data=f"rule_dur_{rid}"),
+         InlineKeyboardButton("↕️ Порядок", callback_data=f"rule_order_{rid}")],
+        [InlineKeyboardButton("📝 Описание", callback_data=f"rule_desc_{rid}")],
+        [InlineKeyboardButton(
+            "🔄 Перезаливка: выкл" if not r["allow_repost"] else "🔄 Перезаливка: вкл",
+            callback_data=f"rule_repost_{rid}",
+        )],
+        [InlineKeyboardButton("▶️ Тест: опубликовать 1 сейчас", callback_data=f"rule_now_{rid}")],
+        [InlineKeyboardButton("🗑 Удалить правило", callback_data=f"rule_del_{rid}")],
+        [InlineKeyboardButton("⬅️ К списку", callback_data="rule_list")],
+    ])
+
+
+async def _plan_and_notify(query, context, rule_id: int) -> None:
+    r = db.get_rule(rule_id)
+    if not r or not r["enabled"]:
+        return
+    n = scheduler.plan_rule(context.job_queue, r)
+    if n:
+        try:
+            await context.bot.send_message(query.message.chat_id, f"🗓 Запланировано на сегодня: {n} видео.")
+        except Exception:
+            pass
+
+
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    db.ensure_user(update.effective_user.id)
+    cur = _get_account(update.effective_user.id)
+    await update.message.reply_text(
+        "Твои правила публикации:", reply_markup=rules_kb(update.effective_user.id, cur["id"] if cur else None)
+    )
+    return ConversationHandler.END
+
+
+async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+
+    cur_acc = _get_account(telegram_id)
+    cur_acc_id = cur_acc["id"] if cur_acc else None
+
+    if data == "rule_list":
+        await query.answer()
+        await query.edit_message_text(
+            "Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id)
+        )
+        return
+
+    if data == "rule_add":
+        await query.answer()
+        groups = db.get_groups(telegram_id, account_id=cur_acc_id)
+        sources = db.get_sources(telegram_id, for_account_id=cur_acc_id)
+        if not sources or not groups:
+            await query.edit_message_text(
+                "Сначала добавь хотя бы один источник и одну группу "
+                f"({BTN_SOURCES}, {BTN_GROUPS})."
+            )
+            return
+        await query.edit_message_text("Выбери группу:", reply_markup=_rule_group_picker_kb(groups))
+        return
+
+    if data.startswith("rule_gpg_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        groups = db.get_groups(telegram_id, account_id=cur_acc_id)
+        await query.edit_message_text("Выбери группу:", reply_markup=_rule_group_picker_kb(groups, page))
+        return
+
+    if data.startswith("rule_grp_"):
+        await query.answer()
+        group_id = int(data.rsplit("_", 1)[1])
+        context.user_data["new_rule_group"] = group_id
+        group = db.get_group(group_id)
+        account_id = group["account_id"] if group else None
+        sources = db.get_sources(telegram_id, for_account_id=account_id)
+        if not sources:
+            await query.edit_message_text(
+                f"Нет источников для этого аккаунта. Добавь источник ({BTN_SOURCES}).",
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
+            )
+            return
+        rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
+        await query.edit_message_text("Теперь выбери источник:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("rule_src_"):
+        await query.answer()
+        source_id = int(data.rsplit("_", 1)[1])
+        group_id = context.user_data.get("new_rule_group")
+        if not group_id:
+            await query.edit_message_text(
+                "Что-то пошло не так, начни заново.",
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
+            )
+            return
+        try:
+            rid = db.add_rule(telegram_id, source_id, group_id)
+        except Exception:
+            await query.edit_message_text(
+                "⚠️ Такое правило (этот источник → эта группа) уже существует.",
+                reply_markup=rules_kb(telegram_id, cur_acc_id),
+            )
+            return
+        r = db.get_rule(rid)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        await _plan_and_notify(query, context, rid)
+        return
+
+    if data.startswith("rule_open_"):
+        await query.answer()
+        r = db.get_rule(int(data.rsplit("_", 1)[1]))
+        if not r:
+            await query.edit_message_text("Правило не найдено.", reply_markup=rules_kb(telegram_id, cur_acc_id))
+            return
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        return
+
+    if data.startswith("rule_toggle_"):
+        await query.answer()
+        rid = int(data.rsplit("_", 1)[1])
+        r = db.get_rule(rid)
+        was_enabled = r["enabled"]
+        db.update_rule(rid, enabled=0 if was_enabled else 1)
+        r = db.get_rule(rid)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        if not was_enabled:
+            await _plan_and_notify(query, context, rid)
+        return
+
+    if data.startswith("rule_repost_"):
+        await query.answer()
+        rid = int(data.rsplit("_", 1)[1])
+        r = db.get_rule(rid)
+        db.update_rule(rid, allow_repost=0 if r["allow_repost"] else 1)
+        r = db.get_rule(rid)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        return
+
+    if data.startswith("rule_now_"):
+        rid = int(data.rsplit("_", 1)[1])
+        ok, msg = scheduler.schedule_test_now(context.job_queue, rid)
+        await query.answer(msg[:200], show_alert=True)
+        return
+
+    if data.startswith("rule_order_"):
+        await query.answer()
+        rid = int(data.rsplit("_", 1)[1])
+        r = db.get_rule(rid)
+        db.update_rule(rid, order_dir="new" if r["order_dir"] == "old" else "old")
+        r = db.get_rule(rid)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        return
+
+    if data.startswith("rule_del_"):
+        await query.answer("Удалено")
+        db.delete_rule(int(data.rsplit("_", 1)[1]))
+        await query.edit_message_text(
+            "Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id)
+        )
+        return
+
+    await query.answer()
+
+
+_RULE_FIELD_PROMPTS = {
+    "nday":  "Сколько видео в день публиковать? Пришли число (например 3):",
+    "slots": "Во сколько публиковать? Пришли часы МСК через запятую (например 9,15,20):",
+    "desc":  "Пришли текст описания к записям (или «-», чтобы убрать):",
+    "dur":   ("Фильтр по длительности в секундах. Пришли «min max» (например «30 60»).\n"
+              "Только минимум: «30 -». Только максимум: «- 60». Убрать фильтр: «-»."),
+}
+
+
+async def rule_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    _, field, rid = query.data.split("_")
+    rid = int(rid)
+    context.user_data["edit_rule_id"] = rid
+    context.user_data["edit_rule_field"] = field
+    if field == "desc" and db.get_templates(update.effective_user.id):
+        await query.edit_message_text(
+            "Выбери заготовку или введи описание вручную:",
+            reply_markup=build_desc_picker_kb(update.effective_user.id),
+        )
+        return RULE_DESC_PICK
+    await query.edit_message_text(_RULE_FIELD_PROMPTS[field])
+    return RULE_EDIT_VALUE
+
+
+async def rule_desc_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    rid = context.user_data.get("edit_rule_id")
+    data = query.data
+
+    if data == "rule_desc_manual":
+        await query.edit_message_text(_RULE_FIELD_PROMPTS["desc"])
+        return RULE_EDIT_VALUE
+
+    if data == "rule_desc_clear":
+        db.update_rule(rid, description=None)
+        db.update_scheduled_posts_description(rid, None)
+        r = db.get_rule(rid)
+        context.user_data.pop("edit_rule_id", None)
+        context.user_data.pop("edit_rule_field", None)
+        await query.edit_message_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+        return ConversationHandler.END
+
+    if data.startswith("rule_tpl_"):
+        tpl_id = int(data.rsplit("_", 1)[1])
+        tpl = db.get_template(tpl_id)
+        new_desc = tpl["body"] if tpl else None
+        db.update_rule(rid, description=new_desc)
+        synced = db.update_scheduled_posts_description(rid, new_desc)
+        r = db.get_rule(rid)
+        msg = rule_detail_text(r)
+        if synced:
+            msg += f"\n\n📝 Применено к {synced} запланированным постам."
+        context.user_data.pop("edit_rule_id", None)
+        context.user_data.pop("edit_rule_field", None)
+        await query.edit_message_text(msg, reply_markup=rule_detail_kb(r))
+        return ConversationHandler.END
+
+    return RULE_DESC_PICK
+
+
+async def rule_edit_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    rid = context.user_data.get("edit_rule_id")
+    field = context.user_data.get("edit_rule_field")
+    text = update.message.text.strip()
+    if rid is None or field is None:
+        await update.message.reply_text("Сессия истекла, открой правило заново.")
+        return ConversationHandler.END
+
+    error = None
+    if field == "nday":
+        if not text.isdigit() or int(text) < 1:
+            error = "Нужно целое число ≥ 1."
+        else:
+            db.update_rule(rid, videos_per_day=int(text))
+    elif field == "slots":
+        hours = scheduler.parse_slots(text)
+        if not hours:
+            error = "Не понял слоты. Пример: 9,15,20 (часы 0–23)."
+        else:
+            db.update_rule(rid, slots=",".join(str(h) for h in hours))
+    elif field == "desc":
+        new_desc = None if text == "-" else text
+        db.update_rule(rid, description=new_desc)
+        synced = db.update_scheduled_posts_description(rid, new_desc)
+        if synced:
+            await update.message.reply_text(
+                f"📝 Описание обновлено и применено к {synced} уже запланированным постам."
+            )
+    elif field == "dur":
+        lo, hi, err = _parse_duration_input(text)
+        if err:
+            error = err
+        else:
+            db.update_rule(rid, min_duration=lo, max_duration=hi)
+
+    if error:
+        await update.message.reply_text(f"❌ {error} Попробуй ещё раз или /cancel.")
+        return RULE_EDIT_VALUE
+
+    r = db.get_rule(rid)
+    await update.message.reply_text(rule_detail_text(r), reply_markup=rule_detail_kb(r))
+    context.user_data.pop("edit_rule_id", None)
+    context.user_data.pop("edit_rule_field", None)
+    return ConversationHandler.END
+
+
+def _parse_duration_input(text: str) -> tuple[int | None, int | None, str | None]:
+    if text == "-":
+        return None, None, None
+    parts = text.split()
+    if len(parts) != 2:
+        return None, None, "Формат: «min max», например «30 60» (или '-' для пусто)."
+
+    def one(tok):
+        if tok == "-":
+            return None, None
+        if tok.isdigit():
+            return int(tok), None
+        return None, "не число"
+
+    lo, e1 = one(parts[0])
+    hi, e2 = one(parts[1])
+    if e1 or e2:
+        return None, None, "Границы должны быть числами или '-'."
+    if lo is not None and hi is not None and lo > hi:
+        return None, None, "Минимум больше максимума."
+    return lo, hi, None
+
+
+# ─── Заготовки описаний ───────────────────────────────────────────────────────
+
+async def cmd_templates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    await update.message.reply_text(
+        "Твои заготовки описаний:",
+        reply_markup=build_templates_manage_keyboard(telegram_id),
+    )
+    return ConversationHandler.END
+
+
+async def templates_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    data = query.data
+    telegram_id = update.effective_user.id
+
+    if data.startswith("t_pg_"):
+        await query.answer()
+        page = int(data[len("t_pg_"):])
+        await query.edit_message_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id, page),
+        )
+        return ConversationHandler.END
+
+    if data == "t_add":
+        await query.answer()
+        context.user_data.pop("edit_template_id", None)
+        await query.edit_message_text("Введи название заготовки (короткое, для себя):")
+        return T_TITLE
+
+    if data.startswith("t_del_"):
+        await query.answer("Удалено")
+        db.delete_template(int(data.rsplit("_", 1)[1]))
+        await query.edit_message_text(
+            "Твои заготовки описаний:",
+            reply_markup=build_templates_manage_keyboard(telegram_id),
+        )
+        return ConversationHandler.END
+
+    if data.startswith("t_edit_"):
+        await query.answer()
+        context.user_data["edit_template_id"] = int(data.rsplit("_", 1)[1])
+        await query.edit_message_text("Введи новое название заготовки:")
+        return T_TITLE
+
+    await query.answer()
+    return ConversationHandler.END
+
+
+async def templates_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["template_title"] = update.message.text.strip()
+    await update.message.reply_text("Теперь введи текст описания:")
+    return T_BODY
+
+
+async def templates_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    title = context.user_data.get("template_title", "")
+    body = update.message.text
+    edit_id = context.user_data.get("edit_template_id")
+    if edit_id:
+        db.update_template(edit_id, title, body)
+        msg = "✅ Заготовка обновлена."
+    else:
+        db.add_template(telegram_id, title, body)
+        msg = "✅ Заготовка добавлена."
+    context.user_data.pop("edit_template_id", None)
+    context.user_data.pop("template_title", None)
+    await update.message.reply_text(
+        f"{msg}\n\nТвои заготовки описаний:",
+        reply_markup=build_templates_manage_keyboard(telegram_id),
+    )
+    return ConversationHandler.END
+
+
+# ─── Статус ───────────────────────────────────────────────────────────────────
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    cur = _get_account(telegram_id)
+    cur_acc_id = cur["id"] if cur else None
+    rules = db.get_rules(telegram_id, account_id=cur_acc_id)
+    if not rules:
+        await update.message.reply_text("Пока нет ни одного правила. Добавь через 📋 Правила.")
+        return
+
+    acc_label = f"🔑 Аккаунт: {cur['name']}\n" if cur else ""
+    pause_note = "⏸ Публикация ОСТАНОВЛЕНА (/startBot — включить)\n\n" if scheduler.is_publishing_paused() else ""
+    lines = [f"{pause_note}📊 Статус автопубликации:\n{acc_label}"]
+    for r in rules:
+        mark = "🟢" if r["enabled"] else "⚪"
+        published = db.count_published(r["id"])
+        queued = len(db.get_scheduled_ids(r["id"]))
+        available = "?"
+        try:
+            exclude = db.get_published_ids(r["id"]) | db.get_scheduled_ids(r["id"])
+            src = db.get_source(r["source_id"])
+            cands = fetch_candidates(
+                src["db_path"], username=src["username"],
+                min_duration=r["min_duration"], max_duration=r["max_duration"],
+                order_dir=r["order_dir"], exclude_ids=exclude,
+            )
+            available = str(len(cands))
+        except SourceError:
+            available = "нет доступа к базе"
+        lines.append(
+            f"{mark} {r['source_name']} → {r['group_name']}\n"
+            f"    {r['videos_per_day']}/день, слоты {r['slots']} · "
+            f"опубл. {published} · в очереди {queued} · осталось {available}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+
+# ─── Статистика публикаций ────────────────────────────────────────────────────
+
+_STATS_PERIODS = {"today": "Сегодня", "week": "7 дней", "all": "Всё время"}
+
+
+def _stats_period_bounds(period: str) -> tuple[int, int]:
+    now = datetime.now(MOSCOW_TZ)
+    end_ts = int(now.timestamp())
+    if period == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_ts = int(start.timestamp())
+    elif period == "week":
+        start_ts = end_ts - 7 * 24 * 3600
+    else:
+        start_ts = 0
+    return start_ts, end_ts
+
+
+def _build_stats_text(telegram_id: int, period: str) -> str:
+    cur = _get_account(telegram_id)
+    cur_acc_id = cur["id"] if cur else None
+    rules = db.get_rules(telegram_id, account_id=cur_acc_id)
+    if not rules:
+        return "Пока нет ни одного правила. Добавь через 📋 Правила."
+
+    start_ts, end_ts = _stats_period_bounds(period)
+    lines = [f"📈 Статистика публикаций · {_STATS_PERIODS[period]}\n"]
+    total_pub = total_q = total_avail = 0
+
+    for r in rules:
+        published = (
+            db.count_published(r["id"]) if period == "all"
+            else db.count_published_between(r["id"], start_ts, end_ts)
+        )
+        queued = len(db.get_scheduled_ids(r["id"]))
+        available_n = 0
+        available_s = "?"
+        try:
+            exclude = db.get_published_ids(r["id"]) | db.get_scheduled_ids(r["id"])
+            src = db.get_source(r["source_id"])
+            cands = fetch_candidates(
+                src["db_path"], username=src["username"],
+                min_duration=r["min_duration"], max_duration=r["max_duration"],
+                order_dir=r["order_dir"], exclude_ids=exclude,
+            )
+            available_n = len(cands)
+            available_s = str(available_n)
+        except SourceError:
+            available_s = "?"
+
+        total_pub += published
+        total_q += queued
+        total_avail += available_n
+        mark = "🟢" if r["enabled"] else "⚪"
+        lines.append(
+            f"{mark} {r['source_name']} → {r['group_name']}\n"
+            f"   ✅ Выложено: {published}   📅 В очереди: {queued}   📂 Осталось: {available_s}"
+        )
+
+    if len(rules) > 1:
+        lines.append(
+            f"\n📊 Итого: выложено {total_pub} · в очереди {total_q} · осталось {total_avail}"
+        )
+    return "\n".join(lines)
+
+
+def _stats_keyboard(current_period: str) -> InlineKeyboardMarkup:
+    period_row = [
+        InlineKeyboardButton(
+            ("✅ " if k == current_period else "") + label,
+            callback_data=f"stats_period_{k}",
+        )
+        for k, label in _STATS_PERIODS.items()
+    ]
+    chart_row = [InlineKeyboardButton("📊 График", callback_data=f"stats_chart_{current_period}")]
+    return InlineKeyboardMarkup([period_row, chart_row])
+
+
+def _build_stats_chart(telegram_id: int, period: str) -> bytes | None:
+    """Строит bar-chart публикаций за период. Возвращает PNG-байты или None если данных нет."""
+    start_ts, end_ts = _stats_period_bounds(period)
+    timestamps = db.get_published_timestamps_for_user(telegram_id, start_ts, end_ts)
+    if not timestamps:
+        return None
+
+    now = datetime.now(MOSCOW_TZ)
+
+    if period == "today":
+        # Группируем по часам 0-23
+        buckets: dict[int, int] = {h: 0 for h in range(24)}
+        for ts in timestamps:
+            hour = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).hour
+            buckets[hour] = buckets.get(hour, 0) + 1
+        labels = [f"{h:02d}:00" for h in range(24)]
+        values = [buckets[h] for h in range(24)]
+        xlabel = "Час (МСК)"
+        title = f"Публикации за сегодня, {now.strftime('%d.%m.%Y')}"
+    elif period == "week":
+        # Группируем по дням за последние 7 дней
+        days = [(now - timedelta(days=i)).date() for i in range(6, -1, -1)]
+        buckets2: dict = {d: 0 for d in days}
+        for ts in timestamps:
+            d = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).date()
+            if d in buckets2:
+                buckets2[d] += 1
+        labels = [d.strftime("%d.%m") for d in days]
+        values = [buckets2[d] for d in days]
+        xlabel = "Дата"
+        title = "Публикации за 7 дней"
+    else:
+        # Все данные: группируем по дням
+        dates_set: dict = {}
+        for ts in timestamps:
+            d = datetime.fromtimestamp(ts, tz=MOSCOW_TZ).date()
+            dates_set[d] = dates_set.get(d, 0) + 1
+        sorted_dates = sorted(dates_set.keys())
+        labels = [d.strftime("%d.%m") for d in sorted_dates]
+        values = [dates_set[d] for d in sorted_dates]
+        xlabel = "Дата"
+        title = "Публикации за всё время"
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    bar_color = "#5b9bd5"
+    bars = ax.bar(range(len(labels)), values, color=bar_color, width=0.6, zorder=3)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45 if len(labels) > 10 else 0,
+                       ha="right" if len(labels) > 10 else "center", fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=10)
+    ax.set_ylabel("Роликов", fontsize=10)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.yaxis.get_major_locator().set_params(integer=True)
+    ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    # Подписи значений на столбцах
+    for bar, val in zip(bars, values):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
+                    str(val), ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    db.ensure_user(telegram_id)
+    period = "today"
+    text = _build_stats_text(telegram_id, period)
+    await update.message.reply_text(text, reply_markup=_stats_keyboard(period))
+
+
+async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    period = query.data.replace("stats_period_", "")
+    if period not in _STATS_PERIODS:
+        return
+    telegram_id = query.from_user.id
+    db.ensure_user(telegram_id)
+    text = _build_stats_text(telegram_id, period)
+    await query.edit_message_text(text, reply_markup=_stats_keyboard(period))
+
+
+async def stats_chart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    period = query.data.replace("stats_chart_", "")
+    if period not in _STATS_PERIODS:
+        return
+    telegram_id = query.from_user.id
+    db.ensure_user(telegram_id)
+    chart = _build_stats_chart(telegram_id, period)
+    if chart is None:
+        await query.answer("Нет данных для графика за этот период.", show_alert=True)
+        return
+    caption = f"📊 График публикаций · {_STATS_PERIODS[period]}"
+    await query.message.reply_photo(photo=BytesIO(chart), caption=caption)
+
+
+# ─── Обработка видео (только владелец) ────────────────────────────────────────
+
+def _process_settings() -> tuple[str, bool]:
+    mode = db.get_setting(video_processor.SETTING_MODE, video_processor.OFF)
+    downscale = db.get_setting(video_processor.SETTING_DOWNSCALE, "0") == "1"
+    return mode, downscale
+
+
+def process_view() -> tuple[str, InlineKeyboardMarkup]:
+    """Экран настройки обработки: текущий режим + кнопки-переключатели."""
+    mode, downscale = _process_settings()
+    enabled = video_processor.is_enabled(mode)
+
+    if enabled:
+        p = video_processor.PRESETS[mode]
+        current = f"{p['label']} ({p['x264']}, CRF {p['crf']}, {p['eta']})"
+    else:
+        current = "выключено — видео публикуется как есть"
+
+    text = (
+        "⚙️ Обработка видео перед публикацией\n\n"
+        f"Сейчас: {current}\n"
+        f"Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p: "
+        f"{'✅ вкл' if downscale else '❌ выкл'}\n\n"
+        "Ролик перекодируется целиком (меняется хеш файла), метаданные TikTok "
+        "заменяются на правдоподобные «съёмка с телефона».\n"
+        f"Ролики длиннее {video_processor.MAX_DURATION} с публикуются без обработки.\n"
+        "Оценки времени — для минутного ролика на 1 ядре."
+    )
+
+    rows = [[InlineKeyboardButton(
+        ("✅ " if not enabled else "") + "Выключено",
+        callback_data=f"proc_set_{video_processor.OFF}")]]
+    for key, p in video_processor.PRESETS.items():
+        mark = "✅ " if mode == key else ""
+        rows.append([InlineKeyboardButton(
+            f"{mark}{p['label']} · {p['x264']} · {p['eta']}",
+            callback_data=f"proc_set_{key}")])
+    rows.append([InlineKeyboardButton(
+        f"📐 Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p: "
+        f"{'✅ вкл' if downscale else '❌ выкл'}",
+        callback_data="proc_ds")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update.effective_user.id):
+        return  # не владелец — раздела просто не существует
+    text, kb = process_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def process_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(update.effective_user.id):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    data = query.data
+
+    if data == "proc_ds":
+        mode, downscale = _process_settings()
+        db.set_setting(video_processor.SETTING_DOWNSCALE, "0" if downscale else "1")
+        note = (f"📐 Даунскейл до {video_processor.DOWNSCALE_SHORT_SIDE}p "
+                f"{'выключен' if downscale else 'включён'}.")
+        if not video_processor.is_enabled(mode):
+            note += " Заработает, когда включишь обработку."
+    else:
+        new_mode = data[len("proc_set_"):]
+        if new_mode != video_processor.OFF and not video_processor.is_enabled(new_mode):
+            await query.answer("Неизвестный режим")
+            return
+        db.set_setting(video_processor.SETTING_MODE, new_mode)
+        if new_mode == video_processor.OFF:
+            note = "✅ Обработка выключена — видео публикуется как есть."
+        else:
+            p = video_processor.PRESETS[new_mode]
+            note = (f"✅ Режим обработки: {p['label']} "
+                    f"({p['x264']}, CRF {p['crf']}, {p['eta']}).")
+        note += "\nПрименится к следующей публикации, включая уже запланированные."
+
+    await query.answer()
+    text, kb = process_view()
+    await query.edit_message_text(f"{note}\n\n{text}", reply_markup=kb)
+
+
+# ─── Ошибки / админ-панель ────────────────────────────────────────────────────
+
+def _is_admin(telegram_id: int) -> bool:
+    return telegram_id in ADMIN_IDS
+
+
+def _fmt_ts(epoch: int) -> str:
+    return datetime.fromtimestamp(epoch, tz=MOSCOW_TZ).strftime("%d.%m.%Y %H:%M")
+
+
+def _err_btn_label(e) -> str:
+    ts = datetime.fromtimestamp(e["created_at"], tz=MOSCOW_TZ).strftime("%d.%m %H:%M")
+    code = f"VK{e['error_code']}" if e["error_code"] is not None else (e["stage"] or "ошибка")
+    return f"{ts} · {e['platform'] or '—'} · {code}"[:60]
+
+
+def _kb(rows):
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _pager_rows(page: int, total: int, prefix: str):
+    pages = (total + ERRORS_PAGE_SIZE - 1) // ERRORS_PAGE_SIZE
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{prefix}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"{prefix}_{page + 1}"))
+    return [nav] if nav else []
+
+
+def _own_list_view(telegram_id: int, page: int):
+    total = db.count_errors(telegram_id)
+    errors = db.get_errors(telegram_id, ERRORS_PAGE_SIZE, page * ERRORS_PAGE_SIZE)
+    rows = [[InlineKeyboardButton(_err_btn_label(e), callback_data=f"err_v_{e['id']}")] for e in errors]
+    rows += _pager_rows(page, total, "err_self")
+    return f"📋 Твои ошибки: {total}", _kb(rows)
+
+
+def _admin_users_view(page: int):
+    total = db.count_users_with_errors()
+    if not total:
+        return "🛠 Админ-панель ошибок\n\n✅ Ошибок пока нет.", None
+    users = db.get_users_with_errors(ERRORS_PAGE_SIZE, page * ERRORS_PAGE_SIZE)
+    rows = [[InlineKeyboardButton(
+        f"👤 {u['telegram_id']} · {u['cnt']} ошиб. · {_fmt_ts(u['last_at'])}",
+        callback_data=f"err_u_{u['telegram_id']}_0")] for u in users]
+    rows += _pager_rows(page, total, "err_au")
+    return f"🛠 Админ-панель ошибок\nПользователей с ошибками: {total}", _kb(rows)
+
+
+def _admin_user_errors_view(target_id: int, page: int):
+    total = db.count_errors(target_id)
+    errors = db.get_errors(target_id, ERRORS_PAGE_SIZE, page * ERRORS_PAGE_SIZE)
+    rows = [[InlineKeyboardButton(_err_btn_label(e), callback_data=f"err_v_{e['id']}")] for e in errors]
+    rows += _pager_rows(page, total, f"err_u_{target_id}")
+    rows.append([InlineKeyboardButton("⬅️ К пользователям", callback_data="err_au_0")])
+    return f"👤 Пользователь {target_id}\nОшибок: {total}", InlineKeyboardMarkup(rows)
+
+
+def _detail_view(e, viewer_is_admin: bool):
+    grp = e["vk_group_name"] or "—"
+    if e["vk_group_id"]:
+        grp += f" (id {e['vk_group_id']})"
+    code = f"VK {e['error_code']}" if e["error_code"] is not None else "—"
+    text = (
+        f"🆔 Ошибка #{e['id']}\n🕒 {_fmt_ts(e['created_at'])} МСК\n"
+        f"📍 Этап: {e['stage'] or '—'}\n🎬 Платформа: {e['platform'] or '—'}\n"
+        f"👥 Группа: {grp}\n🔢 Код: {code}\n🔗 {e['url'] or '—'}\n\n💬 {e['message'] or '—'}"
+    )
+    tb = e["traceback"]
+    if tb:
+        budget = 3500 - len(text)
+        if budget > 200:
+            snippet = tb if len(tb) <= budget else "…(обрезано)…\n" + tb[-budget:]
+            text += f"\n\n🧩 Traceback:\n{snippet}"
+    if len(text) > 4096:
+        text = text[:4000] + "\n…(обрезано)"
+    rows = [[InlineKeyboardButton("📄 Полный traceback файлом", callback_data=f"err_tb_{e['id']}")]]
+    rows.append([InlineKeyboardButton(
+        "⬅️ Назад", callback_data=f"err_u_{e['telegram_id']}_0" if viewer_is_admin else "err_self_0")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_errors(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    db.ensure_user(uid)
+    if _is_admin(uid):
+        text, kb = _admin_users_view(0)
+        await update.message.reply_text(text, reply_markup=kb)
+        return
+    if db.count_errors(uid) == 0:
+        await update.message.reply_text("✅ У тебя нет залогированных ошибок.")
+        return
+    text, kb = _own_list_view(uid, 0)
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def errors_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    uid = update.effective_user.id
+    is_admin = _is_admin(uid)
+    parts = query.data.split("_")
+    kind = parts[1]
+
+    if kind == "self":
+        await query.answer()
+        text, kb = _own_list_view(uid, int(parts[2]))
+        await query.edit_message_text(text, reply_markup=kb)
+    elif kind == "au":
+        if not is_admin:
+            await query.answer("Недостаточно прав", show_alert=True); return
+        await query.answer()
+        text, kb = _admin_users_view(int(parts[2]))
+        await query.edit_message_text(text, reply_markup=kb)
+    elif kind == "u":
+        if not is_admin:
+            await query.answer("Недостаточно прав", show_alert=True); return
+        await query.answer()
+        text, kb = _admin_user_errors_view(int(parts[2]), int(parts[3]))
+        await query.edit_message_text(text, reply_markup=kb)
+    elif kind == "v":
+        e = db.get_error(int(parts[2]))
+        if not e:
+            await query.answer("Не найдено", show_alert=True); return
+        if not is_admin and e["telegram_id"] != uid:
+            await query.answer("Недостаточно прав", show_alert=True); return
+        await query.answer()
+        text, kb = _detail_view(e, is_admin)
+        await query.edit_message_text(text, reply_markup=kb)
+    elif kind == "tb":
+        e = db.get_error(int(parts[2]))
+        if not e:
+            await query.answer("Не найдено", show_alert=True); return
+        if not is_admin and e["telegram_id"] != uid:
+            await query.answer("Недостаточно прав", show_alert=True); return
+        await query.answer()
+        content = e["traceback"] or e["message"] or "—"
+        bio = BytesIO(content.encode("utf-8"))
+        bio.name = f"error_{e['id']}.txt"
+        await query.message.reply_document(document=bio, filename=f"error_{e['id']}.txt")
+
+
+async def _cleanup_errors_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, db.cleanup_old_errors, ERROR_RETENTION_DAYS)
+    if deleted:
+        logger.info("Очистка логов ошибок: удалено %s записей", deleted)
+
+
+# ─── Метрика групп (только админ) ─────────────────────────────────────────────
+
+def _metrics_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📈 График {d} дн", callback_data=f"met_chart_{d}")
+         for d in metrics.CHART_PERIODS],
+        [InlineKeyboardButton("🔄 Обновить (PDF)", callback_data="met_refresh"),
+         InlineKeyboardButton("📝 Текстом", callback_data="met_text")],
+    ])
+
+
+async def _send_metrics_report(message, *, refresh: bool) -> None:
+    """Снять свежий снимок (если refresh) и прислать PDF-отчёт по всем группам."""
+    loop = asyncio.get_running_loop()
+    note = ""
+    wait = await message.reply_text(
+        "⏳ Снимаю подписчиков всех групп и собираю PDF…" if refresh else "⏳ Собираю PDF…"
+    )
+    try:
+        if refresh:
+            res = await loop.run_in_executor(None, metrics.collect_snapshot)
+            note = f"Снято: {res['saved']} из {res['total']}."
+        now = int(time.time())
+        data = await loop.run_in_executor(None, metrics.report_data, now)
+        pdf = await loop.run_in_executor(None, metrics.build_pdf, now)
+    finally:
+        await wait.delete()
+    if pdf is None:
+        await message.reply_text("Пока ни у одного пользователя нет групп.")
+        return
+    head = metrics.summary_lines(data)
+    caption = "\n".join(["📊 " + head[0], *head[1:], *([note] if note else [])])
+    await message.reply_document(
+        document=BytesIO(pdf), filename=metrics.pdf_filename(now),
+        caption=caption[:1024], reply_markup=_metrics_kb(),
+    )
+
+
+async def _send_metrics_text(message) -> None:
+    """Тот же отчёт текстом (без нового снимка)."""
+    loop = asyncio.get_running_loop()
+    lines = await loop.run_in_executor(None, metrics.build_report)
+    for part in metrics.split_messages(lines):
+        await message.reply_text(part)
+
+
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/metrics — свежий снимок + PDF-отчёт; /metrics <id группы> — график одной группы."""
+    if not _is_admin(update.effective_user.id):
+        return
+    if context.args:
+        try:
+            gid = abs(int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text("Формат: /metrics или /metrics <id группы VK>")
+            return
+        days = 30
+        if len(context.args) > 1 and context.args[1].isdigit():
+            days = max(2, min(int(context.args[1]), 365))
+        loop = asyncio.get_running_loop()
+        chart = await loop.run_in_executor(None, metrics.build_chart, days, None, gid)
+        if chart is None:
+            await update.message.reply_text("Мало данных для графика этой группы (нужно ≥ 2 дней снимков).")
+            return
+        await update.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Группа {gid} · {days} дн")
+        return
+    await _send_metrics_report(update.message, refresh=True)
+
+
+async def metrics_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not _is_admin(query.from_user.id):
+        await query.answer()
+        return
+    if query.data == "met_refresh":
+        await query.answer("Обновляю…")
+        await _send_metrics_report(query.message, refresh=True)
+        return
+    if query.data == "met_text":
+        await query.answer()
+        await _send_metrics_text(query.message)
+        return
+    days = int(query.data.rsplit("_", 1)[1])
+    await query.answer()
+    loop = asyncio.get_running_loop()
+    chart = await loop.run_in_executor(None, metrics.build_chart, days)
+    if chart is None:
+        await query.message.reply_text(
+            "Мало данных для графика: снимки копятся раз в сутки, нужно хотя бы 2 дня."
+        )
+        return
+    await query.message.reply_photo(photo=BytesIO(chart), caption=f"📈 Все группы · {days} дн")
+
+
+async def _metrics_snapshot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, metrics.collect_snapshot)
+    except Exception:
+        logger.exception("Не удалось снять метрику групп")
+
+
+# ─── /stop, /startBot — глобальная пауза публикации ───────────────────────────
+
+async def cmd_stop_publishing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    if not _is_admin(telegram_id):
+        return
+    scheduler.set_publishing_paused(True)
+    await update.message.reply_text(
+        "⏸ Публикация остановлена. Уже стоящие в очереди видео публиковаться не "
+        "будут, пока не пришлёшь /startBot. Планирование (раскладка новых видео "
+        "по слотам) продолжается — просто ничего не будет уходить в VK."
+    )
+
+
+async def cmd_start_publishing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    telegram_id = update.effective_user.id
+    if not _is_admin(telegram_id):
+        return
+    scheduler.set_publishing_paused(False)
+    await update.message.reply_text("▶️ Публикация возобновлена.")
+
+
+# ─── /cancel ──────────────────────────────────────────────────────────────────
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Отменено.", reply_markup=main_keyboard(update.effective_user.id))
+    return ConversationHandler.END
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("Не задан TELEGRAM_TOKEN в .env")
+
+    db.init_db()
+
+    persistence = PicklePersistence(filepath=os.path.join(db.DATA_DIR, "bot_state.pickle"))
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .persistence(persistence)
+        .post_init(scheduler.restore_and_schedule)
+        .concurrent_updates(True)
+        .connect_timeout(30.0).read_timeout(30.0).write_timeout(30.0).pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0).get_updates_read_timeout(30.0)
+        .build()
+    )
+
+    accounts_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(acc_button, pattern=r"^(acc_add|acc_rename_|acc_token_|acc_del_|noop$)"),
+        ],
+        states={
+            ACC_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_name)],
+            ACC_TOKEN:        [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_token)],
+            ACC_RENAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_rename)],
+            ACC_CHANGE_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_change_token)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        conversation_timeout=300, name="accounts_conv", persistent=False, allow_reentry=True,
+    )
+
+    groups_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("groups", cmd_groups),
+            CallbackQueryHandler(groups_button, pattern=r"^(g_add|g_del_\d+|g_rename_\d+|g_page_\d+|noop$)"),
+        ],
+        states={
+            G_ADD_ID:      [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_id)],
+            G_ADD_CONFIRM: [CallbackQueryHandler(groups_add_confirm, pattern=r"^g_(confirmname|manualname)$")],
+            G_ADD_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_add_name)],
+            G_RENAME:      [MessageHandler(filters.TEXT & ~filters.COMMAND, groups_rename)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        conversation_timeout=300, name="groups_conv", persistent=False, allow_reentry=True,
+    )
+
+    sources_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("sources", cmd_sources),
+            CallbackQueryHandler(sources_button, pattern=r"^(src_add|src_del_|src_refresh_|src_start_)"),
+        ],
+        states={
+            SRC_NAME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_name)],
+            SRC_TYPE:    [CallbackQueryHandler(sources_type, pattern=r"^src_type_(account|db)$")],
+            SRC_ACCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_account)],
+            SRC_PATH:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_path)],
+            SRC_USER:    [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_user)],
+            SRC_START:   [MessageHandler(filters.TEXT & ~filters.COMMAND, sources_start_save)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        conversation_timeout=300, name="sources_conv", persistent=False, allow_reentry=True,
+    )
+
+    rule_edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(rule_edit_start, pattern=r"^rule_(nday|slots|desc|dur)_\d+$")],
+        states={
+            RULE_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, rule_edit_save)],
+            RULE_DESC_PICK: [CallbackQueryHandler(
+                rule_desc_pick,
+                pattern=r"^(rule_tpl_\d+|rule_desc_manual|rule_desc_clear)$",
+            )],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        conversation_timeout=300, name="rule_edit_conv", persistent=False, allow_reentry=True,
+    )
+
+    templates_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("templates", cmd_templates),
+            CallbackQueryHandler(templates_button, pattern=r"^(t_add|t_del_\d+|t_edit_\d+|t_pg_\d+|noop$)"),
+        ],
+        states={
+            T_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_title)],
+            T_BODY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, templates_body)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        per_message=False,
+        conversation_timeout=300,
+        name="templates_conv",
+        persistent=False,
+        allow_reentry=True,
+    )
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("rules", cmd_rules))
+    app.add_handler(CommandHandler("errors", cmd_errors))
+    app.add_handler(CommandHandler("admin", cmd_errors))
+    app.add_handler(CommandHandler("stop", cmd_stop_publishing))
+    app.add_handler(CommandHandler("startBot", cmd_start_publishing))
+    app.add_handler(CommandHandler("process", cmd_process))
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
+    app.add_handler(CallbackQueryHandler(metrics_callback, pattern=r"^met_(refresh|text|chart_\d+)$"))
+    app.add_handler(CallbackQueryHandler(stats_callback, pattern=r"^stats_period_"))
+    app.add_handler(CallbackQueryHandler(stats_chart_callback, pattern=r"^stats_chart_"))
+    app.add_handler(CallbackQueryHandler(errors_callback, pattern=r"^err_"))
+    app.add_handler(CallbackQueryHandler(
+        process_button, pattern=r"^proc_(ds|set_(off|" + "|".join(video_processor.PRESETS) + r"))$"))
+    app.add_handler(MessageHandler(filters.Text(MENU_BUTTON_TEXTS), main_menu_button))
+    app.add_handler(accounts_conv)
+    app.add_handler(groups_conv)
+    app.add_handler(sources_conv)
+    app.add_handler(templates_conv)
+    app.add_handler(rule_edit_conv)
+    app.add_handler(CallbackQueryHandler(
+        rules_button,
+        pattern=r"^(rule_list|rule_add|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
+    ))
+
+    scheduler.register_jobs(app)
+    app.job_queue.run_repeating(
+        _cleanup_errors_job, interval=timedelta(days=ERROR_CLEANUP_INTERVAL_DAYS),
+        first=timedelta(minutes=1), name="cleanup_errors",
+    )
+    app.job_queue.run_daily(
+        _metrics_snapshot_job,
+        time=dtime(hour=METRICS_HOUR, minute=METRICS_MINUTE, tzinfo=MOSCOW_TZ),
+        name="metrics_snapshot",
+    )
+    # Точка отсчёта роста: если свежего снимка нет (первый запуск или бот долго
+    # лежал) — снять его вскоре после старта, не дожидаясь вечера.
+    age = metrics.last_snapshot_age()
+    if age is None or age > 20 * 3600:
+        app.job_queue.run_once(_metrics_snapshot_job, when=timedelta(minutes=2),
+                               name="metrics_snapshot_start")
+
+    if not ADMIN_IDS:
+        logger.warning("ADMIN_IDS пуст — раздел «Обработка видео» (/process) никому не доступен")
+
+    logger.info("Автопостер запущен")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
