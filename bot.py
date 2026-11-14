@@ -795,14 +795,41 @@ async def sources_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 # ─── Правила ──────────────────────────────────────────────────────────────────
 
-def rules_kb(telegram_id: int, account_id: int | None = None) -> InlineKeyboardMarkup:
+def rules_kb(telegram_id: int, account_id: int | None = None, page: int = 0) -> InlineKeyboardMarkup:
+    all_rules = list(db.get_rules(telegram_id, account_id=account_id))
+    pages = max(1, (len(all_rules) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
     rows = []
-    for r in db.get_rules(telegram_id, account_id=account_id):
+    for r in all_rules[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]:
         mark = "🟢" if r["enabled"] else "⚪"
         rows.append([InlineKeyboardButton(
             f"{mark} {r['source_name']} → {r['group_name']}", callback_data=f"rule_open_{r['id']}"
         )])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rule_pg_{page - 1}"))
+    if pages > 1:
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"rule_pg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("➕ Добавить правило", callback_data="rule_add")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _rule_source_picker_kb(sources: list, page: int = 0) -> InlineKeyboardMarkup:
+    pages = max(1, (len(sources) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")]
+            for s in sources[page * GROUPS_PAGE_SIZE:(page + 1) * GROUPS_PAGE_SIZE]]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"rule_spg_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"rule_spg_{page + 1}"))
+    if nav:
+        rows.append(nav)
     return InlineKeyboardMarkup(rows)
 
 
@@ -918,8 +945,23 @@ async def rules_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 reply_markup=rules_kb(telegram_id, cur_acc_id),
             )
             return
-        rows = [[InlineKeyboardButton(s["name"], callback_data=f"rule_src_{s['id']}")] for s in sources]
-        await query.edit_message_text("Теперь выбери источник:", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text("Теперь выбери источник:", reply_markup=_rule_source_picker_kb(sources))
+        return
+
+    if data.startswith("rule_spg_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        group = db.get_group(context.user_data.get("new_rule_group") or 0)
+        sources = db.get_sources(telegram_id, for_account_id=group["account_id"] if group else cur_acc_id)
+        await query.edit_message_text("Теперь выбери источник:", reply_markup=_rule_source_picker_kb(sources, page))
+        return
+
+    if data.startswith("rule_pg_"):
+        await query.answer()
+        page = int(data.rsplit("_", 1)[1])
+        await query.edit_message_text(
+            "Твои правила публикации:", reply_markup=rules_kb(telegram_id, cur_acc_id, page)
+        )
         return
 
     if data.startswith("rule_src_"):
@@ -1917,7 +1959,7 @@ def main() -> None:
     app.add_handler(rule_edit_conv)
     app.add_handler(CallbackQueryHandler(
         rules_button,
-        pattern=r"^(rule_list|rule_add|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
+        pattern=r"^(rule_list|rule_add|rule_pg_|rule_gpg_|rule_spg_|rule_src_|rule_grp_|rule_open_|rule_toggle_|rule_order_|rule_repost_|rule_now_|rule_del_)",
     ))
 
     scheduler.register_jobs(app)
