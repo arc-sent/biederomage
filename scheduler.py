@@ -13,6 +13,7 @@ import os
 import random
 import traceback as tb_module
 from datetime import datetime, time as dtime, timedelta
+from time import monotonic
 
 import pytz
 
@@ -20,6 +21,7 @@ import db
 import video_processor
 from downloader import (
     detect_platform, download_tiktok, download_likee, download_vk,
+    unavailable_reason,
 )
 from vk import VKError, VK_RETRYABLE_ERROR_CODES, upload_to_vk
 
@@ -30,6 +32,9 @@ MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 VK_PUBLISH_CONCURRENCY = int(os.getenv("VK_PUBLISH_CONCURRENCY", "1"))
 VK_PUBLISH_RETRIES = int(os.getenv("VK_PUBLISH_RETRIES", "3"))
 VK_RETRY_BASE_DELAY = float(os.getenv("VK_RETRY_BASE_DELAY", "3"))
+VK_FLOOD_RETRY_DELAY = float(os.getenv("VK_FLOOD_RETRY_DELAY", "120"))
+VK_FLOOD_RETRIES = int(os.getenv("VK_FLOOD_RETRIES", "3"))
+VK_MIN_POST_INTERVAL_SECONDS = float(os.getenv("VK_MIN_POST_INTERVAL_SECONDS", "90"))
 # Публикации равномерно раскладываются внутри этого окна (не постим ночью).
 PUBLISH_WINDOW_START_HOUR = int(os.getenv("PUBLISH_WINDOW_START_HOUR", "9"))
 PUBLISH_WINDOW_END_HOUR = int(os.getenv("PUBLISH_WINDOW_END_HOUR", "22"))
@@ -38,6 +43,10 @@ DAILY_PLAN_MINUTE = int(os.getenv("DAILY_PLAN_MINUTE", "5"))
 # Пока публикация на паузе (/stop), _publish_job не публикует, а переставляет
 # сам себя на повторную проверку через этот интервал — пост не теряется из очереди.
 PUBLISH_PAUSE_RECHECK_SECONDS = int(os.getenv("PUBLISH_PAUSE_RECHECK_SECONDS", "60"))
+REPLACEMENT_DELAY_SECONDS = int(os.getenv("REPLACEMENT_DELAY_SECONDS", "60"))
+MAX_REPLACEMENTS_IN_ROW = int(os.getenv("MAX_REPLACEMENTS_IN_ROW", "2"))
+UNAVAILABLE_RETRY_DAYS = int(os.getenv("UNAVAILABLE_RETRY_DAYS", "7"))
+_dead_streak: dict[int, int] = {}
 # Автодопарсинг истории: держим запас невыложенных кандидатов на столько дневных
 # норм вперёд; если меньше — углубляемся в историю (не больше N проходов за раз).
 BACKLOG_DAYS = int(os.getenv("BACKLOG_DAYS", "3"))
@@ -64,6 +73,8 @@ VIDEO_PROCESS_CONCURRENCY = int(os.getenv("VIDEO_PROCESS_CONCURRENCY", "1"))
 # Семафор публикации на аккаунт: лимиты VK считаются по токену, поэтому
 # запросы одного аккаунта не идут лавиной, а разные аккаунты не блокируют друг друга.
 _vk_account_semaphores: dict[int, asyncio.Semaphore] = {}
+_last_vk_post: dict[int, float] = {}
+_vk_flood_until: dict[int, float] = {}
 
 # Семафор обработки видео — общий на весь бот (ядро одно на всех).
 _video_semaphore: asyncio.Semaphore | None = None
@@ -79,7 +90,10 @@ def _process_semaphore() -> asyncio.Semaphore:
 def _account_semaphore(account_id: int) -> asyncio.Semaphore:
     sem = _vk_account_semaphores.get(account_id)
     if sem is None:
-        sem = asyncio.Semaphore(VK_PUBLISH_CONCURRENCY)
+        # Интервал от завершения предыдущего поста требует одного активного
+        # вызова upload_to_vk на аккаунт.
+        concurrency = 1 if VK_MIN_POST_INTERVAL_SECONDS > 0 else VK_PUBLISH_CONCURRENCY
+        sem = asyncio.Semaphore(concurrency)
         _vk_account_semaphores[account_id] = sem
     return sem
 
@@ -145,23 +159,42 @@ async def _process(file_path: str, telegram_id: int, *, url: str | None = None,
 async def _publish_to_vk(account_id, vk_token, vk_group_id, file_path, title, description) -> None:
     loop = asyncio.get_running_loop()
     semaphore = _account_semaphore(account_id)
-    for attempt in range(1, VK_PUBLISH_RETRIES + 1):
+    attempts = flood_attempts = 0
+    while True:
         async with semaphore:
+            while True:
+                wait_until = max(_last_vk_post.get(account_id, float("-inf"))
+                                 + VK_MIN_POST_INTERVAL_SECONDS,
+                                 _vk_flood_until.get(account_id, float("-inf")))
+                wait = wait_until - monotonic()
+                if wait <= 0:
+                    break
+                await asyncio.sleep(wait)
             try:
                 await loop.run_in_executor(
                     None,
                     lambda: upload_to_vk(vk_token, vk_group_id, file_path, title, description),
                 )
+                _last_vk_post[account_id] = monotonic()
                 return
             except VKError as exc:
-                retryable = (exc.network or exc.code in VK_RETRYABLE_ERROR_CODES) and not exc.no_retry
-                if not retryable or attempt == VK_PUBLISH_RETRIES:
+                if exc.code == 9:
+                    flood_attempts += 1
+                    _vk_flood_until[account_id] = monotonic() + VK_FLOOD_RETRY_DELAY
+                    if exc.no_retry or flood_attempts >= VK_FLOOD_RETRIES:
+                        raise
+                    logger.warning("VK Flood control (попытка %s/%s). Пауза аккаунта %.1f с",
+                                   flood_attempts, VK_FLOOD_RETRIES, VK_FLOOD_RETRY_DELAY)
+                    continue
+                attempts += 1
+                retryable = exc.network or exc.code in VK_RETRYABLE_ERROR_CODES
+                if exc.no_retry or not retryable or attempts >= VK_PUBLISH_RETRIES:
                     raise
                 last_exc = exc
         # Пауза вне семафора — другие ролики этого юзера могут публиковаться.
-        delay = VK_RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 2)
+        delay = VK_RETRY_BASE_DELAY * (2 ** (attempts - 1)) + random.uniform(0, 2)
         logger.warning("Публикация не удалась (попытка %s/%s): %s. Повтор через %.1f c",
-                       attempt, VK_PUBLISH_RETRIES, last_exc, delay)
+                       attempts, VK_PUBLISH_RETRIES, last_exc, delay)
         await asyncio.sleep(delay)
 
 
@@ -250,10 +283,9 @@ def plan_rule(job_queue, rule) -> int:
     rule_id = rule["id"]
     now = datetime.now(MOSCOW_TZ)
 
-    # Дневная квота: N видео В ДЕНЬ, а не за вызов. Считаем, сколько по этому
-    # правилу уже опубликовано и уже стоит в очереди на СЕГОДНЯ, и добираем
-    # только остаток. Иначе повторный прогон (старт + ежедневный job) задвоил бы.
-    day_start = MOSCOW_TZ.localize(datetime(now.year, now.month, now.day))
+    # Считаем остаток квоты на дату слотов: после закрытия окна это уже завтра.
+    window_start, _ = _publish_window(now)
+    day_start = window_start.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
     start_ts, end_ts = int(day_start.timestamp()), int(day_end.timestamp())
     already = (db.count_scheduled_between(rule_id, start_ts, end_ts)
@@ -270,7 +302,8 @@ def plan_rule(job_queue, rule) -> int:
         return 0
 
     # Исключаем уже опубликованные И уже стоящие в очереди — чтобы не задвоить.
-    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
+    unavailable = db.get_unavailable_ids()
+    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id) | unavailable
 
     try:
         candidates = fetch_candidates(
@@ -303,7 +336,7 @@ def plan_rule(job_queue, rule) -> int:
                 min_duration=rule["min_duration"],
                 max_duration=rule["max_duration"],
                 order_dir=rule["order_dir"],
-                exclude_ids=db.get_scheduled_ids(rule_id),
+                exclude_ids=db.get_scheduled_ids(rule_id) | unavailable,
                 limit=remaining,
             )
         except SourceError as e:
@@ -345,7 +378,7 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
 
     Игнорирует дневную квоту (это ручная проверка настроек), но соблюдает дедуп.
     """
-    from source_reader import fetch_candidates, SourceError
+    from source_reader import SourceError
 
     rule = db.get_rule(rule_id)
     if not rule:
@@ -353,31 +386,68 @@ def schedule_test_now(job_queue, rule_id: int) -> tuple[bool, str]:
     if not rule["account_id"] or not db.get_vk_token_by_account(rule["account_id"]):
         return False, "Сначала задай VK токен для аккаунта этой группы."
 
-    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id)
     try:
-        cands = fetch_candidates(
-            rule["db_path"], username=rule["username"],
-            min_duration=rule["min_duration"], max_duration=rule["max_duration"],
-            order_dir=rule["order_dir"], exclude_ids=exclude, limit=1,
-        )
+        publish_at = int(datetime.now(MOSCOW_TZ).timestamp()) + 5
+        video, post_id = _schedule_next_video(job_queue, rule, publish_at)
     except SourceError as e:
         return False, f"Источник недоступен: {e}"
-    if not cands:
-        return False, "Нет новых видео (все уже опубликованы или в очереди)."
+    if video is None:
+        return False, "Нет доступных новых видео."
+    if post_id is None:
+        return False, "Это видео уже стоит в очереди на публикацию."
+    return True, f"▶️ Публикую тестовое видео (~через 5 сек):\n{video['url']}"
 
-    v = cands[0]
-    publish_at = int(datetime.now(MOSCOW_TZ).timestamp()) + 5
+
+def _schedule_next_video(job_queue, rule, publish_at: int):
+    from source_reader import fetch_candidates
+
+    rule_id = rule["id"]
+    exclude = db.get_published_ids(rule_id) | db.get_scheduled_ids(rule_id) | db.get_unavailable_ids()
+    candidates = fetch_candidates(
+        rule["db_path"], username=rule["username"],
+        min_duration=rule["min_duration"], max_duration=rule["max_duration"],
+        order_dir=rule["order_dir"], exclude_ids=exclude, limit=1,
+    )
+    if not candidates:
+        return None, None
+    video = candidates[0]
     post_id = db.add_scheduled_post(
         telegram_id=rule["telegram_id"], rule_id=rule_id,
-        tt_video_id=v["tt_video_id"], url=v["url"], title=v["title"],
+        tt_video_id=video["tt_video_id"], url=video["url"], title=video["title"],
         description=rule["description"], vk_group_id=rule["vk_group_id"],
         vk_group_name=rule["group_name"], publish_at=publish_at,
         account_id=rule["account_id"],
     )
+    if post_id is not None:
+        _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
+    return video, post_id
+
+
+def schedule_replacement(job_queue, rule_id: int) -> str | None:
+    """Заполнить освободившееся место в квоте после удаления упавшего поста."""
+    from source_reader import SourceError
+
+    rule = db.get_rule(rule_id)
+    if not rule or not rule["enabled"]:
+        return None
+    when = datetime.now(MOSCOW_TZ) + timedelta(seconds=REPLACEMENT_DELAY_SECONDS)
+    day_start = when.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ts = int(day_start.timestamp())
+    end_ts = int((day_start + timedelta(days=1)).timestamp())
+    already = (db.count_scheduled_between(rule_id, start_ts, end_ts)
+               + db.count_published_between(rule_id, start_ts, end_ts))
+    if already >= rule["videos_per_day"]:
+        return None
+
+    try:
+        video, post_id = _schedule_next_video(job_queue, rule, int(when.timestamp()))
+    except SourceError as exc:
+        logger.warning("Правило %s: замену не поставить, источник недоступен: %s", rule_id, exc)
+        return None
     if post_id is None:
-        return False, "Это видео уже стоит в очереди на публикацию."
-    _schedule_post_job(job_queue, {"id": post_id, "publish_at": publish_at})
-    return True, f"▶️ Публикую тестовое видео (~через 5 сек):\n{v['url']}"
+        return None
+    logger.info("Правило %s: вместо недоступного ролика ставлю %s", rule_id, video["url"])
+    return video["url"]
 
 
 # ─── Джобы ────────────────────────────────────────────────────────────────────
@@ -421,9 +491,10 @@ def _min_remaining(src_rules, cap: int) -> int:
     """
     from source_reader import fetch_candidates
 
+    unavailable = db.get_unavailable_ids()
     worst = cap
     for r in src_rules:
-        exclude = db.get_published_ids(r["id"]) | db.get_scheduled_ids(r["id"])
+        exclude = db.get_published_ids(r["id"]) | db.get_scheduled_ids(r["id"]) | unavailable
         cands = fetch_candidates(
             r["db_path"], username=r["username"],
             min_duration=r["min_duration"], max_duration=r["max_duration"],
@@ -553,6 +624,7 @@ async def _publish_job(context) -> None:
     platform = detect_platform(url)
     file_path = None
     proc_note = ""
+    downloading = False
 
     try:
         if not account_id:
@@ -561,7 +633,9 @@ async def _publish_job(context) -> None:
         if not vk_token:
             raise VKError(None, "VK токен не задан для этого аккаунта", stage="проверка токена")
 
+        downloading = True
         file_path, title = await _download(url, vk_token)
+        downloading = False
         title = post["title"] or title
         sent_description = post["description"] or ""
         file_path, proc_note = await _process(
@@ -572,6 +646,8 @@ async def _publish_job(context) -> None:
                              title, sent_description)
 
         db.mark_published(rule_id, post["tt_video_id"])
+        _dead_streak.pop(rule_id, None)
+        db.delete_scheduled_post(post_id)
         # Диагностика описания: показываем владельцу, что реально ушло в VK как
         # описание для КАЖДОГО ролика (чтобы отличить потерю на нашей стороне от
         # того, что VK не показал текст). Можно убрать после разбора.
@@ -590,17 +666,31 @@ async def _publish_job(context) -> None:
         stage = exc.stage if isinstance(exc, VKError) else "публикация"
         _record_error(telegram_id, exc, stage=stage, platform=platform, url=url,
                       vk_group_id=vk_group_id, vk_group_name=group_name)
+        reason = unavailable_reason(exc) if downloading else None
+        if reason:
+            db.mark_unavailable(post["tt_video_id"], reason, ttl_seconds=UNAVAILABLE_RETRY_DAYS * 86400)
+        db.delete_scheduled_post(post_id)
+        skip_note = ""
+        if reason:
+            skip_note = f"\n⏭ Ролик недоступен — отложил его на {UNAVAILABLE_RETRY_DAYS} дн."
+            streak = _dead_streak.get(rule_id, 0) + 1
+            _dead_streak[rule_id] = streak
+            if streak <= MAX_REPLACEMENTS_IN_ROW:
+                replacement = schedule_replacement(context.job_queue, rule_id)
+                if replacement:
+                    skip_note += (f"\n🔁 Вместо него через {REPLACEMENT_DELAY_SECONDS} с "
+                                  f"выложу следующий: {replacement}")
+            elif streak == MAX_REPLACEMENTS_IN_ROW + 1:
+                skip_note += "\n🛑 Замены остановил. Следующие ролики выйдут по расписанию."
         try:
             await context.bot.send_message(
                 telegram_id,
                 f"❌ Не удалось опубликовать в «{group_name}»:\n{exc}\n\n"
-                f"🔗 {url}\nℹ️ Подробности — в /errors",
+                f"🔗 {url}\nℹ️ Подробности — в /errors{skip_note}",
             )
         except Exception:
             pass
     finally:
-        # Публикация завершена (успех или финальная ошибка) — убираем из очереди.
-        db.delete_scheduled_post(post_id)
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)

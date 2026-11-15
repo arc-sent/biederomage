@@ -46,9 +46,9 @@ Telegram-бот, который автоматически публикует в
   видео качается в момент слота, а не заранее).
 
 ## Ключевые инварианты (НЕ сломать)
-- **Дневная квота**: `plan_rule` планирует не N за вызов, а N в день. Остаток =
-  videos_per_day − (запланировано сегодня + опубликовано сегодня). Иначе
-  старт + ежедневный job задваивают. См. count_scheduled_between/count_published_between.
+- **Дневная квота**: `plan_rule` планирует N в день. Остаток равен videos_per_day
+  за вычетом запланированного и опубликованного на дату слотов.
+  См. count_scheduled_between/count_published_between.
 - **Дедуп на правило**, а не глобально: одно видео может уйти в разные группы.
 - Источник читается **только на чтение** (`source_reader._connect_ro`, mode=ro) —
   файл базы парсера бот не меняет.
@@ -58,8 +58,20 @@ Telegram-бот, который автоматически публикует в
 ## Планировщик (scheduler.py)
 - `restore_and_schedule` (post_init): вернуть очередь из БД + догнать план на сегодня.
 - `register_jobs`: run_daily(daily_plan_job) в DAILY_PLAN_HOUR:MINUTE МСК.
-- `_publish_job`: скачать → _publish_to_vk (семафор на юзера + ретраи) → mark_published
+- `_publish_job`: скачать → _publish_to_vk (семафор на аккаунт + ретраи) → mark_published
   → удалить scheduled_post. Успех/ошибка — уведомление владельцу; ошибка ещё в /errors.
+- `VK_MIN_POST_INTERVAL_SECONDS` (90 с) задаёт минимальную паузу после успешной
+  публикации аккаунта. При включённом интервале семафор пропускает одну попытку
+  публикации за раз. При нуле используется `VK_PUBLISH_CONCURRENCY`.
+  Код VK 9 ставит весь аккаунт на паузу `VK_FLOOD_RETRY_DELAY` (120 с).
+  `VK_FLOOD_RETRIES` (3) включает первую попытку. Остальные ретраи сохраняют
+  прежний экспоненциальный бэкофф.
+- При распознанной недоступности на этапе скачивания `unavailable_videos` исключает
+  ролик из планирования на `UNAVAILABLE_RETRY_DAYS` (7 дней). После освобождения
+  места в очереди следующий кандидат правила ставится через
+  `REPLACEMENT_DELAY_SECONDS` (60 с) в рамках квоты даты замены.
+  `MAX_REPLACEMENTS_IN_ROW` (2) ограничивает цепочку на правило. Первый успешный
+  пост сбрасывает `_dead_streak`. Общий HTTP 403 считается ошибкой скачивания.
 - `compute_publish_times`: равномерная раскладка N по окну `PUBLISH_WINDOW_START_HOUR..
   PUBLISH_WINDOW_END_HOUR` МСК (по умолчанию 9..22) — окно делится на videos_per_day
   интервалов, повторный прогон продолжает с индекса `already`, а не начинает заново.
@@ -90,12 +102,29 @@ Telegram-бот, который автоматически публикует в
 
 ## Проверка после изменений
 ```bash
-python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader.py account_source.py
+python -m py_compile bot.py db.py vk.py scheduler.py source_reader.py downloader.py account_source.py vless_config.py
 python -m pytest -q
 # логика без сети: DATA_DIR=$(mktemp -d), init_db, plan_rule с фейковым job_queue
 ```
 Реальную публикацию/Telegram локально не гоняем (нужны токены). bot.py импортируется
 без запуска polling — этого достаточно для smoke-теста хендлеров.
+
+## Прокси для скачивания (TikTok, VLESS)
+
+- `DOWNLOAD_PROXY` передаётся боту через Compose. TikTok начинает скачивание
+  напрямую (`proxy=""`), при сбое повторяет через `DOWNLOAD_PROXY`.
+  `proxy=None` в `_download_ytdlp_sync` выбирает `DOWNLOAD_PROXY`.
+  Загрузка в VK использует свой сетевой путь.
+- Для VLESS задайте в `.env` `VLESS_URL=vless://…` (или HTTPS-адрес подписки),
+  `COMPOSE_PROFILES=vless` и `DOWNLOAD_PROXY=socks5h://xray:1080`. Выполните на
+  хосте `python3 vless_config.py`, затем `docker compose up -d --build`.
+  После смены ключа пересоберите конфиг скриптом и выполните
+  `docker compose restart xray`. Xray слушает SOCKS5 внутри Docker-сети.
+  Файл `xray/config.json` с ключом исключён из Git.
+- `VLESS_PICK` и `VLESS_SKIP` фильтруют серверы подписки по частям имён через
+  запятую. Несколько серверов собираются в `proxy-N` за балансировщиком
+  leastPing с проверками observatory раз в 10 минут. До первых результатов
+  применяется `fallbackTag=proxy-0`. Поддержаны tcp/ws/grpc и none/tls/reality.
 
 ## Источники-аккаунты (парсер встроен — Фаза 3 сделана)
 - `sources.kind` = 'db' (внешний путь) | 'account' (бот парсит сам).

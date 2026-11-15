@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 MAX_VIDEO_DURATION = 180  # секунд (3 минуты)
 
-# Прокси для скачивания видео (все платформы). Формат: http://user:pass@host:port
+# Запасной прокси для TikTok, например socks5h://xray:1080.
 DOWNLOAD_PROXY: str | None = os.getenv("DOWNLOAD_PROXY") or None
 
 
@@ -90,9 +90,10 @@ def _download_ytdlp_sync(
     default_title: str,
     proxy: str | None = None,
 ) -> tuple[str, str]:
-    _proxy = proxy or DOWNLOAD_PROXY
+    """None выбирает DOWNLOAD_PROXY, пустая строка отключает прокси."""
+    _proxy = DOWNLOAD_PROXY if proxy is None else proxy
     meta_opts: dict = {"quiet": True, "no_warnings": True}
-    if _proxy:
+    if _proxy is not None:
         meta_opts["proxy"] = _proxy
 
     # Фаза 1: получаем метаданные без скачивания — проверяем длительность
@@ -117,7 +118,7 @@ def _download_ytdlp_sync(
         # загрузок не будут конкурировать за один и тот же кэш-файл.
         "cachedir": os.path.join(tmpdir, ".cache"),
     }
-    if _proxy:
+    if _proxy is not None:
         ydl_opts["proxy"] = _proxy
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -139,9 +140,26 @@ def _download_ytdlp_sync(
     return _ensure_h264(candidate), title
 
 
+_UNAVAILABLE_MARKERS = (
+    "You do not have permission to view this post",
+    "This video has been removed",
+)
+# TikTok возвращает этот ответ и для удалённых постов, и при блокировке IP.
+_TIKTOK_BLOCKED_MARKER = "Your IP address is blocked from accessing this post"
+TIKTOK_BLOCKED_REASON = "TikTok не отдаёт пост (удалён или закрыт для региона)"
+
+
+def unavailable_reason(exc: BaseException) -> str | None:
+    """Определить недоступность ролика после завершения скачивания с ретраями."""
+    message = str(exc)
+    if _TIKTOK_BLOCKED_MARKER in message:
+        return TIKTOK_BLOCKED_REASON if DOWNLOAD_PROXY else None
+    return next((marker for marker in _UNAVAILABLE_MARKERS if marker in message), None)
+
+
 def _download_tiktok_sync(url: str, save_path: str | None) -> tuple[str, str]:
     try:
-        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy=None)
+        return _download_ytdlp_sync(url, save_path, "tiktok", "TikTok Video", proxy="")
     except ValueError:
         raise  # видео слишком длинное — прокси не поможет
     except Exception as first_err:

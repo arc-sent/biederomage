@@ -4,6 +4,7 @@
 token.key
 *.key
 *cookies*.txt
+xray/config.json
 
 # Данные бота (база, состояние, временные видео)
 data/

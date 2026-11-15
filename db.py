@@ -139,6 +139,13 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_sched_rule ON scheduled_posts (rule_id);
 
+            CREATE TABLE IF NOT EXISTS unavailable_videos (
+                tt_video_id TEXT PRIMARY KEY,
+                reason      TEXT NOT NULL,
+                marked_at   INTEGER NOT NULL,
+                expires_at  INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS description_templates (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 telegram_id INTEGER NOT NULL,
@@ -674,6 +681,25 @@ def get_published_ids(rule_id: int) -> set[str]:
             "SELECT tt_video_id FROM published WHERE rule_id = ?", (rule_id,)
         ).fetchall()
     return {r["tt_video_id"] for r in rows}
+
+
+def mark_unavailable(tt_video_id: str, reason: str, ttl_seconds: int) -> None:
+    now = int(time.time())
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO unavailable_videos (tt_video_id, reason, marked_at, expires_at) "
+            "VALUES (?, ?, ?, ?)",
+            (tt_video_id, reason, now, now + ttl_seconds),
+        )
+
+
+def get_unavailable_ids() -> set[str]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT tt_video_id FROM unavailable_videos WHERE expires_at > ?",
+            (int(time.time()),),
+        ).fetchall()
+    return {row["tt_video_id"] for row in rows}
 
 
 def clear_published(rule_id: int) -> None:

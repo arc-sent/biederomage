@@ -11,6 +11,13 @@ services:
       - VK_PUBLISH_CONCURRENCY=${VK_PUBLISH_CONCURRENCY:-1}
       - VK_PUBLISH_RETRIES=${VK_PUBLISH_RETRIES:-3}
       - VK_RETRY_BASE_DELAY=${VK_RETRY_BASE_DELAY:-3}
+      - VK_FLOOD_RETRY_DELAY=${VK_FLOOD_RETRY_DELAY:-120}
+      - VK_FLOOD_RETRIES=${VK_FLOOD_RETRIES:-3}
+      - VK_MIN_POST_INTERVAL_SECONDS=${VK_MIN_POST_INTERVAL_SECONDS:-90}
+      - REPLACEMENT_DELAY_SECONDS=${REPLACEMENT_DELAY_SECONDS:-60}
+      - MAX_REPLACEMENTS_IN_ROW=${MAX_REPLACEMENTS_IN_ROW:-2}
+      - UNAVAILABLE_RETRY_DAYS=${UNAVAILABLE_RETRY_DAYS:-7}
+      - DOWNLOAD_PROXY=${DOWNLOAD_PROXY:-}
       - PUBLISH_WINDOW_START_HOUR=${PUBLISH_WINDOW_START_HOUR:-9}
       - PUBLISH_WINDOW_END_HOUR=${PUBLISH_WINDOW_END_HOUR:-22}
       - DAILY_PLAN_HOUR=${DAILY_PLAN_HOUR:-0}
@@ -27,3 +34,10 @@ services:
       # Базы парсера должны быть доступны боту по тем же путям, что указаны в
       # источниках. Смонтируй папку с базами парсера сюда (пример):
       # - C:/Users/androed/Desktop/парсер:/parser:ro
+
+  xray:
+    image: teddysun/xray:latest
+    profiles: ["vless"]
+    restart: unless-stopped
+    volumes:
+      - ./xray:/etc/xray:ro
